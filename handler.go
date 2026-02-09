@@ -23,8 +23,8 @@ type event struct {
 
 var (
 	mu       sync.Mutex
-	apiKey   = os.Getenv("LOGNORTH_API_KEY")
-	endpoint = os.Getenv("LOGNORTH_URL")
+	apiKey   string
+	endpoint string
 	buffer   []event
 	timer    *time.Timer
 	backoff  time.Time
@@ -40,16 +40,64 @@ func init() {
 	}()
 }
 
-// Config sets the API key and endpoint. Optional - reads from env vars by default.
-func Config(key, ep string) {
+// Config sets the endpoint and API key. Call once at startup.
+func Config(url, key string) {
 	mu.Lock()
 	defer mu.Unlock()
-	if key != "" {
-		apiKey = key
+	endpoint = url
+	apiKey = key
+}
+
+// Log sends a regular log message. Batched automatically.
+func Log(message string, ctx map[string]any) {
+	mu.Lock()
+	buffer = append(buffer, event{
+		Message:   message,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Context:   ctx,
+	})
+	n := len(buffer)
+	if timer == nil {
+		timer = time.AfterFunc(5*time.Second, Flush)
 	}
-	if ep != "" {
-		endpoint = ep
+	mu.Unlock()
+
+	if n >= 10 {
+		go Flush()
 	}
+}
+
+// Error sends an error log immediately.
+func Error(message string, err error, ctx map[string]any) {
+	if ctx == nil {
+		ctx = make(map[string]any)
+	}
+	ctx["error"] = err.Error()
+
+	go send([]event{{
+		Message:   message,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		ErrorType: "Error",
+		Context:   ctx,
+	}}, true)
+}
+
+// Flush sends all buffered events.
+func Flush() {
+	mu.Lock()
+	if timer != nil {
+		timer.Stop()
+		timer = nil
+	}
+	if len(buffer) == 0 {
+		mu.Unlock()
+		return
+	}
+	events := buffer
+	buffer = nil
+	mu.Unlock()
+
+	send(events, false)
 }
 
 func send(events []event, isError bool) {
@@ -90,31 +138,7 @@ func send(events []event, isError bool) {
 	}
 }
 
-// Flush sends all buffered events.
-func Flush() {
-	mu.Lock()
-	if timer != nil {
-		timer.Stop()
-		timer = nil
-	}
-	if len(buffer) == 0 {
-		mu.Unlock()
-		return
-	}
-	events := buffer
-	buffer = nil
-	mu.Unlock()
-
-	send(events, false)
-}
-
-func schedule() {
-	if timer == nil {
-		timer = time.AfterFunc(5*time.Second, Flush)
-	}
-}
-
-// Handler implements slog.Handler
+// Handler implements slog.Handler for integration with log/slog.
 type Handler struct {
 	attrs []slog.Attr
 }
@@ -127,42 +151,28 @@ func NewHandler() *Handler {
 func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 
 func (h *Handler) Handle(_ context.Context, r slog.Record) error {
-	e := event{
-		Message:   r.Message,
-		Timestamp: r.Time.UTC().Format(time.RFC3339),
-		Context:   make(map[string]any),
-	}
+	ctx := make(map[string]any)
 
 	for _, a := range h.attrs {
-		e.Context[a.Key] = a.Value.Any()
+		ctx[a.Key] = a.Value.Any()
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		if a.Key == "error" {
 			if err, ok := a.Value.Any().(error); ok {
-				e.Context["error"] = err.Error()
+				ctx["error"] = err.Error()
 			} else {
-				e.Context["error"] = a.Value.Any()
+				ctx["error"] = a.Value.Any()
 			}
 		} else {
-			e.Context[a.Key] = a.Value.Any()
+			ctx[a.Key] = a.Value.Any()
 		}
 		return true
 	})
 
 	if r.Level >= slog.LevelError {
-		e.ErrorType = "Error"
-		go send([]event{e}, true)
-		return nil
-	}
-
-	mu.Lock()
-	buffer = append(buffer, e)
-	n := len(buffer)
-	schedule()
-	mu.Unlock()
-
-	if n >= 10 {
-		go Flush()
+		Error(r.Message, fmt.Errorf("%v", ctx["error"]), ctx)
+	} else {
+		Log(r.Message, ctx)
 	}
 	return nil
 }
@@ -171,23 +181,22 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &Handler{attrs: append(h.attrs, attrs...)}
 }
 
-func (h *Handler) WithGroup(name string) slog.Handler {
-	return h // Groups not supported for simplicity
-}
+func (h *Handler) WithGroup(string) slog.Handler { return h }
 
 // Middleware logs HTTP requests.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: 200}
+
 		next.ServeHTTP(rw, r)
 
-		slog.Info(fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status),
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", rw.status,
-			"duration_ms", time.Since(start).Milliseconds(),
-		)
+		Log(fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status), map[string]any{
+			"method":      r.Method,
+			"path":        r.URL.Path,
+			"status":      rw.status,
+			"duration_ms": time.Since(start).Milliseconds(),
+		})
 	})
 }
 
