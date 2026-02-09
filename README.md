@@ -12,6 +12,11 @@ go get github.com/karloscodes/lognorth-sdk-go
 
 ## Quick Start
 
+```bash
+export LOGNORTH_API_KEY=your_api_key
+export LOGNORTH_URL=https://logs.yoursite.com
+```
+
 ```go
 package main
 
@@ -29,16 +34,37 @@ func main() {
 	})
 	slog.SetDefault(slog.New(handler))
 
-	// Log events
 	slog.Info("User signed up", "user_id", 123)
-
-	// Errors sent immediately with retries
 	slog.Error("Checkout failed", "error", err, "order_id", order.ID)
 
-	// Flush before shutdown
-	handler.Flush()
+	// No need to call Flush - auto-flushes on SIGINT/SIGTERM
 }
 ```
+
+## HTTP Middleware
+
+```go
+import (
+	"net/http"
+
+	lognorth "github.com/karloscodes/lognorth-sdk-go"
+)
+
+func main() {
+	handler := lognorth.NewHandler(lognorth.Config{
+		APIKey:   os.Getenv("LOGNORTH_API_KEY"),
+		Endpoint: os.Getenv("LOGNORTH_URL"),
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", homeHandler)
+
+	// Logs all requests: "GET /path → 200"
+	http.ListenAndServe(":8080", lognorth.Middleware(handler)(mux))
+}
+```
+
+Works with Chi, gorilla/mux, and any router that uses `http.Handler`.
 
 ## How It Works
 
@@ -48,6 +74,7 @@ func main() {
 | Errors (`slog.Error`) | Sent immediately, 3 retries |
 | Buffer limit | 1000 events, drops oldest logs first |
 | Backpressure | Exponential backoff on 429/503 |
+| Shutdown | Auto-flush on SIGINT/SIGTERM |
 
 ## Configuration
 
@@ -69,10 +96,10 @@ log := slog.New(handler).With("service", "api", "version", "1.0")
 log.Info("Request handled", "path", "/users", "status", 200)
 ```
 
-## Shutdown
+## Manual Flush
 
 ```go
-handler.Flush()
+handler.Flush() // If you need to flush manually
 ```
 
 ## License

@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -53,13 +57,23 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxBufferSize = 1000
 	}
 
-	return &Handler{
+	h := &Handler{
 		cfg: cfg,
 		state: &state{
 			buffer:        make([]event, 0, cfg.BatchSize),
 			flushInterval: cfg.FlushInterval,
 		},
 	}
+
+	// Auto-flush on shutdown signals
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		<-c
+		h.Flush()
+	}()
+
+	return h
 }
 
 func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool {
@@ -242,5 +256,49 @@ func (h *Handler) send(events []event, retries int) {
 		if attempt < retries {
 			time.Sleep(time.Second * time.Duration(1<<attempt))
 		}
+	}
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Middleware returns HTTP middleware that logs requests
+func Middleware(handler *Handler) func(http.Handler) http.Handler {
+	log := slog.New(handler)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rw := &responseWriter{ResponseWriter: w, status: 200}
+
+			next.ServeHTTP(rw, r)
+
+			duration := time.Since(start).Milliseconds()
+			msg := fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status)
+
+			if rw.status >= 500 {
+				log.Error(msg,
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", rw.status,
+					"duration_ms", duration,
+				)
+			} else {
+				log.Info(msg,
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", rw.status,
+					"duration_ms", duration,
+				)
+			}
+		})
 	}
 }
