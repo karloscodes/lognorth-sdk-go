@@ -19,7 +19,6 @@ func main() {
 	lognorth.Config("https://logs.yoursite.com", "your-api-key")
 
 	lognorth.Log("User signed up", map[string]any{"user_id": 123})
-
 	lognorth.Error("Checkout failed", err, map[string]any{"order_id": 42})
 }
 ```
@@ -36,7 +35,22 @@ slog.Error("Checkout failed", "error", err)
 ## Middleware
 
 ```go
-http.ListenAndServe(":8080", lognorth.Middleware(mux))
+package main
+
+import (
+	"net/http"
+	lognorth "github.com/karloscodes/lognorth-sdk-go"
+)
+
+func main() {
+	lognorth.Config("https://logs.yoursite.com", "your-api-key")
+
+	http.HandleFunc("/", homeHandler)
+	http.HandleFunc("/users", usersHandler)
+
+	// Wrap with middleware
+	http.ListenAndServe(":8080", lognorth.Middleware(http.DefaultServeMux))
+}
 ```
 
 ## How It Works
