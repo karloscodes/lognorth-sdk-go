@@ -14,71 +14,117 @@ import (
 	"time"
 )
 
-type Config struct {
-	APIKey        string
-	Endpoint      string
-	BatchSize     int
-	FlushInterval time.Duration
-	MaxBufferSize int
-}
-
 type event struct {
-	Message       string         `json:"message"`
-	Timestamp     string         `json:"timestamp"`
-	ErrorType     string         `json:"error_type,omitempty"`
-	ErrorLocation string         `json:"error_location,omitempty"`
-	Context       map[string]any `json:"context,omitempty"`
+	Message   string         `json:"message"`
+	Timestamp string         `json:"timestamp"`
+	ErrorType string         `json:"error_type,omitempty"`
+	Context   map[string]any `json:"context,omitempty"`
 }
 
-// shared state between handler and its WithAttrs/WithGroup clones
-type state struct {
-	mu            sync.Mutex
-	buffer        []event
-	flushTimer    *time.Timer
-	backoffUntil  time.Time
-	flushInterval time.Duration
-}
+var (
+	mu       sync.Mutex
+	apiKey   = os.Getenv("LOGNORTH_API_KEY")
+	endpoint = os.Getenv("LOGNORTH_URL")
+	buffer   []event
+	timer    *time.Timer
+	backoff  time.Time
+)
 
-type Handler struct {
-	cfg    Config
-	attrs  []slog.Attr
-	groups []string
-	state  *state
-}
-
-func NewHandler(cfg Config) *Handler {
-	if cfg.BatchSize == 0 {
-		cfg.BatchSize = 10
-	}
-	if cfg.FlushInterval == 0 {
-		cfg.FlushInterval = 5 * time.Second
-	}
-	if cfg.MaxBufferSize == 0 {
-		cfg.MaxBufferSize = 1000
-	}
-
-	h := &Handler{
-		cfg: cfg,
-		state: &state{
-			buffer:        make([]event, 0, cfg.BatchSize),
-			flushInterval: cfg.FlushInterval,
-		},
-	}
-
-	// Auto-flush on shutdown signals
+func init() {
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
-		h.Flush()
+		Flush()
+		os.Exit(0)
 	}()
-
-	return h
 }
 
-func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool {
-	return true
+// Config sets the API key and endpoint. Optional - reads from env vars by default.
+func Config(key, ep string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if key != "" {
+		apiKey = key
+	}
+	if ep != "" {
+		endpoint = ep
+	}
 }
+
+func send(events []event, isError bool) {
+	if len(events) == 0 || endpoint == "" {
+		return
+	}
+
+	mu.Lock()
+	if time.Now().Before(backoff) {
+		mu.Unlock()
+		return
+	}
+	mu.Unlock()
+
+	body, _ := json.Marshal(map[string]any{"events": events})
+	req, _ := http.NewRequest("POST", endpoint+"/api/v1/events/batch", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if isError {
+			mu.Lock()
+			buffer = append(events, buffer...)
+			mu.Unlock()
+		}
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		mu.Lock()
+		backoff = time.Now().Add(5 * time.Second)
+		if !isError {
+			buffer = append(events, buffer...)
+		}
+		mu.Unlock()
+	}
+}
+
+// Flush sends all buffered events.
+func Flush() {
+	mu.Lock()
+	if timer != nil {
+		timer.Stop()
+		timer = nil
+	}
+	if len(buffer) == 0 {
+		mu.Unlock()
+		return
+	}
+	events := buffer
+	buffer = nil
+	mu.Unlock()
+
+	send(events, false)
+}
+
+func schedule() {
+	if timer == nil {
+		timer = time.AfterFunc(5*time.Second, Flush)
+	}
+}
+
+// Handler implements slog.Handler
+type Handler struct {
+	attrs []slog.Attr
+}
+
+// NewHandler creates a new LogNorth slog handler.
+func NewHandler() *Handler {
+	return &Handler{}
+}
+
+func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 
 func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 	e := event{
@@ -87,179 +133,64 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 		Context:   make(map[string]any),
 	}
 
-	// Add handler-level attrs
 	for _, a := range h.attrs {
-		h.addAttr(e.Context, a)
+		e.Context[a.Key] = a.Value.Any()
 	}
-
-	// Add record attrs
 	r.Attrs(func(a slog.Attr) bool {
-		h.addAttr(e.Context, a)
+		if a.Key == "error" {
+			if err, ok := a.Value.Any().(error); ok {
+				e.Context["error"] = err.Error()
+			} else {
+				e.Context["error"] = a.Value.Any()
+			}
+		} else {
+			e.Context[a.Key] = a.Value.Any()
+		}
 		return true
 	})
 
-	// Extract error info if present
-	if errVal, ok := e.Context["error"]; ok {
-		if err, ok := errVal.(error); ok {
-			e.Context["error"] = err.Error()
-		}
-	}
-	if errType, ok := e.Context["error_type"].(string); ok {
-		e.ErrorType = errType
-		delete(e.Context, "error_type")
-	}
-	if errLoc, ok := e.Context["error_location"].(string); ok {
-		e.ErrorLocation = errLoc
-		delete(e.Context, "error_location")
-	}
-
-	// Errors sent immediately with retries
 	if r.Level >= slog.LevelError {
-		go h.send([]event{e}, 3)
+		e.ErrorType = "Error"
+		go send([]event{e}, true)
 		return nil
 	}
 
-	h.enqueue(e)
+	mu.Lock()
+	buffer = append(buffer, e)
+	n := len(buffer)
+	schedule()
+	mu.Unlock()
+
+	if n >= 10 {
+		go Flush()
+	}
 	return nil
 }
 
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	newAttrs := make([]slog.Attr, len(h.attrs)+len(attrs))
-	copy(newAttrs, h.attrs)
-	copy(newAttrs[len(h.attrs):], attrs)
-
-	return &Handler{
-		cfg:    h.cfg,
-		attrs:  newAttrs,
-		groups: h.groups,
-		state:  h.state, // Share state
-	}
+	return &Handler{attrs: append(h.attrs, attrs...)}
 }
 
 func (h *Handler) WithGroup(name string) slog.Handler {
-	newGroups := make([]string, len(h.groups)+1)
-	copy(newGroups, h.groups)
-	newGroups[len(h.groups)] = name
-
-	return &Handler{
-		cfg:    h.cfg,
-		attrs:  h.attrs,
-		groups: newGroups,
-		state:  h.state, // Share state
-	}
+	return h // Groups not supported for simplicity
 }
 
-func (h *Handler) addAttr(m map[string]any, a slog.Attr) {
-	if a.Equal(slog.Attr{}) {
-		return
-	}
+// Middleware logs HTTP requests.
+func Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
 
-	val := a.Value.Resolve()
-	if val.Kind() == slog.KindGroup {
-		group := make(map[string]any)
-		for _, ga := range val.Group() {
-			h.addAttr(group, ga)
-		}
-		m[a.Key] = group
-	} else {
-		m[a.Key] = val.Any()
-	}
+		slog.Info(fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rw.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
 }
 
-func (h *Handler) enqueue(e event) {
-	h.state.mu.Lock()
-	defer h.state.mu.Unlock()
-
-	// Buffer full - drop oldest non-error
-	if len(h.state.buffer) >= h.cfg.MaxBufferSize {
-		for i, ev := range h.state.buffer {
-			if ev.ErrorType == "" {
-				h.state.buffer = append(h.state.buffer[:i], h.state.buffer[i+1:]...)
-				break
-			}
-		}
-	}
-
-	h.state.buffer = append(h.state.buffer, e)
-
-	if h.state.flushTimer == nil {
-		h.state.flushTimer = time.AfterFunc(h.state.flushInterval, func() {
-			h.Flush()
-		})
-	}
-
-	if len(h.state.buffer) >= h.cfg.BatchSize {
-		go h.Flush()
-	}
-}
-
-func (h *Handler) Flush() {
-	h.state.mu.Lock()
-	if len(h.state.buffer) == 0 {
-		h.state.mu.Unlock()
-		return
-	}
-
-	if h.state.flushTimer != nil {
-		h.state.flushTimer.Stop()
-		h.state.flushTimer = nil
-	}
-
-	events := h.state.buffer
-	h.state.buffer = make([]event, 0, h.cfg.BatchSize)
-	h.state.mu.Unlock()
-
-	h.send(events, 1)
-}
-
-func (h *Handler) send(events []event, retries int) {
-	if len(events) == 0 {
-		return
-	}
-
-	// Respect backoff
-	h.state.mu.Lock()
-	if time.Now().Before(h.state.backoffUntil) {
-		wait := time.Until(h.state.backoffUntil)
-		h.state.mu.Unlock()
-		time.Sleep(wait)
-	} else {
-		h.state.mu.Unlock()
-	}
-
-	body, _ := json.Marshal(map[string]any{"events": events})
-
-	for attempt := 0; attempt <= retries; attempt++ {
-		req, _ := http.NewRequest("POST", h.cfg.Endpoint+"/api/v1/events/batch", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+h.cfg.APIKey)
-
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode < 300 {
-				// Success - recover flush interval
-				h.state.mu.Lock()
-				h.state.flushInterval = max(h.cfg.FlushInterval, h.state.flushInterval*9/10)
-				h.state.mu.Unlock()
-				return
-			}
-			if resp.StatusCode == 429 {
-				// Server busy - back off
-				h.state.mu.Lock()
-				h.state.flushInterval = min(h.state.flushInterval*2, time.Minute)
-				h.state.backoffUntil = time.Now().Add(h.state.flushInterval)
-				h.state.mu.Unlock()
-			}
-		}
-
-		if attempt < retries {
-			time.Sleep(time.Second * time.Duration(1<<attempt))
-		}
-	}
-}
-
-// responseWriter wraps http.ResponseWriter to capture status code
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -268,37 +199,4 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
-}
-
-// Middleware returns HTTP middleware that logs requests
-func Middleware(handler *Handler) func(http.Handler) http.Handler {
-	log := slog.New(handler)
-
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			rw := &responseWriter{ResponseWriter: w, status: 200}
-
-			next.ServeHTTP(rw, r)
-
-			duration := time.Since(start).Milliseconds()
-			msg := fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status)
-
-			if rw.status >= 500 {
-				log.Error(msg,
-					"method", r.Method,
-					"path", r.URL.Path,
-					"status", rw.status,
-					"duration_ms", duration,
-				)
-			} else {
-				log.Info(msg,
-					"method", r.Method,
-					"path", r.URL.Path,
-					"status", rw.status,
-					"duration_ms", duration,
-				)
-			}
-		})
-	}
 }
