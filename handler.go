@@ -9,6 +9,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,7 +21,6 @@ import (
 type event struct {
 	Message   string         `json:"message"`
 	Timestamp string         `json:"timestamp"`
-	ErrorType string         `json:"error_type,omitempty"`
 	Context   map[string]any `json:"context,omitempty"`
 }
 
@@ -38,6 +41,17 @@ func init() {
 		Flush()
 		os.Exit(0)
 	}()
+}
+
+// ErrorFields are the structured error fields added to context for error events.
+// SDKs populate these automatically; the server uses them for three-tier issue grouping.
+type ErrorFields struct {
+	Error      string `json:"error"`
+	ErrorClass string `json:"error_class"`
+	ErrorFile  string `json:"error_file"`
+	ErrorLine  int    `json:"error_line"`
+	ErrorCaller string `json:"error_caller"`
+	StackTrace string `json:"stack_trace"`
 }
 
 // Config sets the endpoint and API key. Call once at startup.
@@ -74,10 +88,34 @@ func Error(message string, err error, ctx map[string]any) {
 	}
 	ctx["error"] = err.Error()
 
+	// Extract error class from type
+	errorClass := "error"
+	if err != nil {
+		t := reflect.TypeOf(err)
+		if t != nil {
+			errorClass = strings.TrimPrefix(t.String(), "*")
+		}
+	}
+	ctx["error_class"] = errorClass
+
+	// Get caller info
+	if pc, file, line, ok := runtime.Caller(1); ok {
+		ctx["error_file"] = filepath.Base(file)
+		ctx["error_line"] = line
+		if fn := runtime.FuncForPC(pc); fn != nil {
+			parts := strings.Split(fn.Name(), ".")
+			ctx["error_caller"] = parts[len(parts)-1]
+		}
+	}
+
+	// Capture stack trace
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	ctx["stack_trace"] = string(buf[:n])
+
 	go send([]event{{
 		Message:   message,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		ErrorType: "Error",
 		Context:   ctx,
 	}}, true)
 }
@@ -170,7 +208,11 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 	})
 
 	if r.Level >= slog.LevelError {
-		Error(r.Message, fmt.Errorf("%v", ctx["error"]), ctx)
+		errVal := ctx["error"]
+		if errVal == nil {
+			errVal = r.Message
+		}
+		Error(r.Message, fmt.Errorf("%v", errVal), ctx)
 	} else {
 		Log(r.Message, ctx)
 	}

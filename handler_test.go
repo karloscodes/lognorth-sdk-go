@@ -82,8 +82,18 @@ func TestError(t *testing.T) {
 
 	events := received[0]["events"].([]any)
 	event := events[0].(map[string]any)
-	if event["error_type"] != "Error" {
-		t.Errorf("expected error_type 'Error', got %v", event["error_type"])
+	ctx := event["context"].(map[string]any)
+	if ctx["error_class"] == nil || ctx["error_class"] == "" {
+		t.Errorf("expected error_class in context, got %v", ctx["error_class"])
+	}
+	if ctx["error_file"] == nil || ctx["error_file"] == "" {
+		t.Errorf("expected error_file in context, got %v", ctx["error_file"])
+	}
+	if ctx["error_line"] == nil || ctx["error_line"] == float64(0) {
+		t.Errorf("expected error_line in context, got %v", ctx["error_line"])
+	}
+	if ctx["stack_trace"] == nil || ctx["stack_trace"] == "" {
+		t.Errorf("expected stack_trace in context, got %v", ctx["stack_trace"])
 	}
 }
 
