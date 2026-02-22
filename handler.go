@@ -3,6 +3,8 @@ package lognorth
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -19,9 +21,32 @@ import (
 )
 
 type event struct {
-	Message   string         `json:"message"`
-	Timestamp string         `json:"timestamp"`
-	Context   map[string]any `json:"context,omitempty"`
+	Message    string         `json:"message"`
+	Timestamp  string         `json:"timestamp"`
+	DurationMS int            `json:"duration_ms"`
+	TraceID    string         `json:"trace_id,omitempty"`
+	Context    map[string]any `json:"context,omitempty"`
+}
+
+type ctxKey int
+
+const traceIDKey ctxKey = 0
+
+func withTraceID(ctx context.Context, traceID string) context.Context {
+	return context.WithValue(ctx, traceIDKey, traceID)
+}
+
+func traceIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(traceIDKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func generateTraceID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 var (
@@ -64,12 +89,21 @@ func Config(url, key string) {
 
 // Log sends a regular log message. Batched automatically.
 func Log(message string, ctx map[string]any) {
-	mu.Lock()
-	buffer = append(buffer, event{
+	logEvent(message, ctx, "")
+}
+
+func logEvent(message string, ctx map[string]any, traceID string, durationMS ...int) {
+	e := event{
 		Message:   message,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		TraceID:   traceID,
 		Context:   ctx,
-	})
+	}
+	if len(durationMS) > 0 {
+		e.DurationMS = durationMS[0]
+	}
+	mu.Lock()
+	buffer = append(buffer, e)
 	n := len(buffer)
 	if timer == nil {
 		timer = time.AfterFunc(5*time.Second, Flush)
@@ -83,12 +117,15 @@ func Log(message string, ctx map[string]any) {
 
 // Error sends an error log immediately.
 func Error(message string, err error, ctx map[string]any) {
+	errorEvent(message, err, ctx, "", 2)
+}
+
+func errorEvent(message string, err error, ctx map[string]any, traceID string, callerSkip int) {
 	if ctx == nil {
 		ctx = make(map[string]any)
 	}
 	ctx["error"] = err.Error()
 
-	// Extract error class from type
 	errorClass := "error"
 	if err != nil {
 		t := reflect.TypeOf(err)
@@ -98,8 +135,7 @@ func Error(message string, err error, ctx map[string]any) {
 	}
 	ctx["error_class"] = errorClass
 
-	// Get caller info
-	if pc, file, line, ok := runtime.Caller(1); ok {
+	if pc, file, line, ok := runtime.Caller(callerSkip); ok {
 		ctx["error_file"] = filepath.Base(file)
 		ctx["error_line"] = line
 		if fn := runtime.FuncForPC(pc); fn != nil {
@@ -108,7 +144,6 @@ func Error(message string, err error, ctx map[string]any) {
 		}
 	}
 
-	// Capture stack trace
 	buf := make([]byte, 4096)
 	n := runtime.Stack(buf, false)
 	ctx["stack_trace"] = string(buf[:n])
@@ -116,6 +151,7 @@ func Error(message string, err error, ctx map[string]any) {
 	go send([]event{{
 		Message:   message,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		TraceID:   traceID,
 		Context:   ctx,
 	}}, true)
 }
@@ -188,8 +224,9 @@ func NewHandler() *Handler {
 
 func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 
-func (h *Handler) Handle(_ context.Context, r slog.Record) error {
+func (h *Handler) Handle(c context.Context, r slog.Record) error {
 	ctx := make(map[string]any)
+	traceID := traceIDFromContext(c)
 
 	for _, a := range h.attrs {
 		ctx[a.Key] = a.Value.Any()
@@ -212,9 +249,9 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 		if errVal == nil {
 			errVal = r.Message
 		}
-		Error(r.Message, fmt.Errorf("%v", errVal), ctx)
+		errorEvent(r.Message, fmt.Errorf("%v", errVal), ctx, traceID, 4)
 	} else {
-		Log(r.Message, ctx)
+		logEvent(r.Message, ctx, traceID)
 	}
 	return nil
 }
@@ -225,20 +262,28 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *Handler) WithGroup(string) slog.Handler { return h }
 
-// Middleware logs HTTP requests.
+// Middleware logs HTTP requests with trace_id propagation.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: 200}
 
+		traceID := r.Header.Get("X-Trace-ID")
+		if traceID == "" {
+			traceID = generateTraceID()
+		}
+		w.Header().Set("X-Trace-ID", traceID)
+		ctx := withTraceID(r.Context(), traceID)
+		r = r.WithContext(ctx)
+
 		next.ServeHTTP(rw, r)
 
-		Log(fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status), map[string]any{
-			"method":      r.Method,
-			"path":        r.URL.Path,
-			"status":      rw.status,
-			"duration_ms": time.Since(start).Milliseconds(),
-		})
+		logEvent(
+			fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status),
+			map[string]any{"method": r.Method, "path": r.URL.Path, "status": rw.status},
+			traceID,
+			int(time.Since(start).Milliseconds()),
+		)
 	})
 }
 

@@ -117,3 +117,107 @@ func TestAuthHeader(t *testing.T) {
 		t.Errorf("expected auth header 'Bearer my-secret-key', got '%s'", authHeader)
 	}
 }
+
+func TestMiddlewareGeneratesTraceID(t *testing.T) {
+	var received []map[string]any
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		json.Unmarshal(body, &data)
+		mu.Lock()
+		received = append(received, data)
+		mu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	Config(server.URL, "test-key")
+
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify trace_id is in request context
+		traceID := traceIDFromContext(r.Context())
+		if traceID == "" {
+			t.Error("expected trace_id in request context")
+		}
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// Check response header
+	if rr.Header().Get("X-Trace-ID") == "" {
+		t.Error("expected X-Trace-ID response header")
+	}
+
+	Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(received) < 1 {
+		t.Fatalf("expected at least 1 request, got %d", len(received))
+	}
+
+	events := received[0]["events"].([]any)
+	event := events[0].(map[string]any)
+
+	if event["trace_id"] == nil || event["trace_id"] == "" {
+		t.Error("expected trace_id on event")
+	}
+	if event["duration_ms"] == nil {
+		t.Error("expected duration_ms as top-level field")
+	}
+	// duration_ms should NOT be in context
+	ctx := event["context"].(map[string]any)
+	if ctx["duration_ms"] != nil {
+		t.Error("duration_ms should not be in context")
+	}
+}
+
+func TestMiddlewareUsesIncomingTraceID(t *testing.T) {
+	var received []map[string]any
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		json.Unmarshal(body, &data)
+		mu.Lock()
+		received = append(received, data)
+		mu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	Config(server.URL, "test-key")
+
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-Trace-ID", "incoming-trace")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Header().Get("X-Trace-ID") != "incoming-trace" {
+		t.Errorf("expected X-Trace-ID 'incoming-trace', got '%s'", rr.Header().Get("X-Trace-ID"))
+	}
+
+	Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	events := received[0]["events"].([]any)
+	event := events[0].(map[string]any)
+	if event["trace_id"] != "incoming-trace" {
+		t.Errorf("expected trace_id 'incoming-trace', got %v", event["trace_id"])
+	}
+}
