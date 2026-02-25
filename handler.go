@@ -89,18 +89,20 @@ func Config(url, key string) {
 
 // Log sends a regular log message. Batched automatically.
 func Log(message string, ctx map[string]any) {
-	logEvent(message, ctx, "")
+	logEvent(message, ctx, "", 0)
 }
 
-func logEvent(message string, ctx map[string]any, traceID string, durationMS ...int) {
-	e := event{
-		Message:   message,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		TraceID:   traceID,
-		Context:   ctx,
+func logEvent(message string, ctx map[string]any, traceID string, durationMS int, ts ...time.Time) {
+	timestamp := time.Now()
+	if len(ts) > 0 && !ts[0].IsZero() {
+		timestamp = ts[0]
 	}
-	if len(durationMS) > 0 {
-		e.DurationMS = durationMS[0]
+	e := event{
+		Message:    message,
+		Timestamp:  timestamp.UTC().Format(time.RFC3339),
+		TraceID:    traceID,
+		DurationMS: durationMS,
+		Context:    ctx,
 	}
 	mu.Lock()
 	buffer = append(buffer, e)
@@ -120,7 +122,11 @@ func Error(message string, err error, ctx map[string]any) {
 	errorEvent(message, err, ctx, "", 2)
 }
 
-func errorEvent(message string, err error, ctx map[string]any, traceID string, callerSkip int) {
+func errorEvent(message string, err error, ctx map[string]any, traceID string, callerSkip int, ts ...time.Time) {
+	timestamp := time.Now()
+	if len(ts) > 0 && !ts[0].IsZero() {
+		timestamp = ts[0]
+	}
 	if ctx == nil {
 		ctx = make(map[string]any)
 	}
@@ -150,7 +156,7 @@ func errorEvent(message string, err error, ctx map[string]any, traceID string, c
 
 	go send([]event{{
 		Message:   message,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: timestamp.UTC().Format(time.RFC3339),
 		TraceID:   traceID,
 		Context:   ctx,
 	}}, true)
@@ -251,7 +257,7 @@ func (h *Handler) Handle(c context.Context, r slog.Record) error {
 		}
 		errorEvent(r.Message, fmt.Errorf("%v", errVal), ctx, traceID, 4)
 	} else {
-		logEvent(r.Message, ctx, traceID)
+		logEvent(r.Message, ctx, traceID, 0)
 	}
 	return nil
 }
@@ -283,6 +289,7 @@ func Middleware(next http.Handler) http.Handler {
 			map[string]any{"method": r.Method, "path": r.URL.Path, "status": rw.status},
 			traceID,
 			int(time.Since(start).Milliseconds()),
+			start,
 		)
 	})
 }
