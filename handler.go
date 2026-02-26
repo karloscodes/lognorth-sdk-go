@@ -90,8 +90,15 @@ func Config(url, key string) {
 }
 
 // Log sends a regular log message. Batched automatically.
+// Use LogCtx to inherit the trace ID from the request context.
 func Log(message string, ctx map[string]any) {
 	logEvent(message, ctx, "", 0)
+}
+
+// LogCtx sends a log message with trace ID inherited from context.
+// Use inside HTTP handlers to link logs to the originating request.
+func LogCtx(c context.Context, message string, ctx map[string]any) {
+	logEvent(message, ctx, traceIDFromContext(c), 0)
 }
 
 func logEvent(message string, ctx map[string]any, traceID string, durationMS int, ts ...time.Time) {
@@ -123,8 +130,15 @@ func logEvent(message string, ctx map[string]any, traceID string, durationMS int
 }
 
 // Error sends an error log immediately.
+// Use ErrorCtx to inherit the trace ID from the request context.
 func Error(message string, err error, ctx map[string]any) {
 	errorEvent(message, err, ctx, "", 2)
+}
+
+// ErrorCtx sends an error with trace ID inherited from context.
+// Use inside HTTP handlers to link errors to the originating request.
+func ErrorCtx(c context.Context, message string, err error, ctx map[string]any) {
+	errorEvent(message, err, ctx, traceIDFromContext(c), 2)
 }
 
 func errorEvent(message string, err error, ctx map[string]any, traceID string, callerSkip int, ts ...time.Time) {
