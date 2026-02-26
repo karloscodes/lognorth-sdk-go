@@ -90,15 +90,11 @@ func Config(url, key string) {
 }
 
 // Log sends a regular log message. Batched automatically.
-// Use LogCtx to inherit the trace ID from the request context.
+// For trace ID propagation inside HTTP handlers, use slog with NewHandler() instead:
+//
+//	slog.InfoContext(r.Context(), "listing users", "page", 1)
 func Log(message string, ctx map[string]any) {
 	logEvent(message, ctx, "", 0)
-}
-
-// LogCtx sends a log message with trace ID inherited from context.
-// Use inside HTTP handlers to link logs to the originating request.
-func LogCtx(c context.Context, message string, ctx map[string]any) {
-	logEvent(message, ctx, traceIDFromContext(c), 0)
 }
 
 func logEvent(message string, ctx map[string]any, traceID string, durationMS int, ts ...time.Time) {
@@ -108,7 +104,7 @@ func logEvent(message string, ctx map[string]any, traceID string, durationMS int
 	}
 	e := event{
 		Message:    message,
-		Timestamp:  timestamp.UTC().Format(time.RFC3339),
+		Timestamp:  timestamp.UTC().Format("2006-01-02T15:04:05.000000Z"),
 		TraceID:    traceID,
 		DurationMS: durationMS,
 		Context:    ctx,
@@ -130,15 +126,11 @@ func logEvent(message string, ctx map[string]any, traceID string, durationMS int
 }
 
 // Error sends an error log immediately.
-// Use ErrorCtx to inherit the trace ID from the request context.
+// For trace ID propagation inside HTTP handlers, use slog with NewHandler() instead:
+//
+//	slog.ErrorContext(r.Context(), "query failed", "error", err)
 func Error(message string, err error, ctx map[string]any) {
 	errorEvent(message, err, ctx, "", 2)
-}
-
-// ErrorCtx sends an error with trace ID inherited from context.
-// Use inside HTTP handlers to link errors to the originating request.
-func ErrorCtx(c context.Context, message string, err error, ctx map[string]any) {
-	errorEvent(message, err, ctx, traceIDFromContext(c), 2)
 }
 
 func errorEvent(message string, err error, ctx map[string]any, traceID string, callerSkip int, ts ...time.Time) {
@@ -175,7 +167,7 @@ func errorEvent(message string, err error, ctx map[string]any, traceID string, c
 
 	go send([]event{{
 		Message:   message,
-		Timestamp: timestamp.UTC().Format(time.RFC3339),
+		Timestamp: timestamp.UTC().Format("2006-01-02T15:04:05.000000Z"),
 		TraceID:   traceID,
 		Context:   ctx,
 	}}, true)
@@ -240,6 +232,28 @@ func send(events []event, isError bool) {
 		mu.Unlock()
 		requeue(events)
 	}
+}
+
+// Logger wraps a context for convenient slog calls with trace ID propagation.
+// Use From(ctx) inside HTTP handlers, then call Info/Error without passing context each time.
+type Logger struct {
+	ctx context.Context
+}
+
+// From creates a Logger bound to the given context.
+// The trace ID from the middleware is carried automatically.
+func From(ctx context.Context) Logger {
+	return Logger{ctx: ctx}
+}
+
+// Info logs a message at info level with the bound context.
+func (l Logger) Info(msg string, args ...any) {
+	slog.Default().InfoContext(l.ctx, msg, args...)
+}
+
+// Error logs a message at error level with the bound context.
+func (l Logger) Error(msg string, args ...any) {
+	slog.Default().ErrorContext(l.ctx, msg, args...)
 }
 
 // Handler implements slog.Handler for integration with log/slog.
