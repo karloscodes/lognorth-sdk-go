@@ -20,10 +20,12 @@ import (
 	"time"
 )
 
+const maxBuffer = 1000
+
 type event struct {
 	Message    string         `json:"message"`
 	Timestamp  string         `json:"timestamp"`
-	DurationMS int            `json:"duration_ms"`
+	DurationMS int            `json:"duration_ms,omitempty"`
 	TraceID    string         `json:"trace_id,omitempty"`
 	Context    map[string]any `json:"context,omitempty"`
 }
@@ -71,12 +73,12 @@ func init() {
 // ErrorFields are the structured error fields added to context for error events.
 // SDKs populate these automatically; the server uses them for three-tier issue grouping.
 type ErrorFields struct {
-	Error      string `json:"error"`
-	ErrorClass string `json:"error_class"`
-	ErrorFile  string `json:"error_file"`
-	ErrorLine  int    `json:"error_line"`
+	Error       string `json:"error"`
+	ErrorClass  string `json:"error_class"`
+	ErrorFile   string `json:"error_file"`
+	ErrorLine   int    `json:"error_line"`
 	ErrorCaller string `json:"error_caller"`
-	StackTrace string `json:"stack_trace"`
+	StackTrace  string `json:"stack_trace"`
 }
 
 // Config sets the endpoint and API key. Call once at startup.
@@ -106,6 +108,9 @@ func logEvent(message string, ctx map[string]any, traceID string, durationMS int
 	}
 	mu.Lock()
 	buffer = append(buffer, e)
+	if len(buffer) > maxBuffer {
+		buffer = buffer[len(buffer)-maxBuffer:]
+	}
 	n := len(buffer)
 	if timer == nil {
 		timer = time.AfterFunc(5*time.Second, Flush)
@@ -180,6 +185,15 @@ func Flush() {
 	send(events, false)
 }
 
+func requeue(events []event) {
+	mu.Lock()
+	buffer = append(events, buffer...)
+	if len(buffer) > maxBuffer {
+		buffer = buffer[:maxBuffer]
+	}
+	mu.Unlock()
+}
+
 func send(events []event, isError bool) {
 	if len(events) == 0 || endpoint == "" {
 		return
@@ -200,9 +214,7 @@ func send(events []event, isError bool) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if isError {
-			mu.Lock()
-			buffer = append(events, buffer...)
-			mu.Unlock()
+			requeue(events)
 		}
 		return
 	}
@@ -211,10 +223,8 @@ func send(events []event, isError bool) {
 	if resp.StatusCode == 429 {
 		mu.Lock()
 		backoff = time.Now().Add(5 * time.Second)
-		if !isError {
-			buffer = append(events, buffer...)
-		}
 		mu.Unlock()
+		requeue(events)
 	}
 }
 
