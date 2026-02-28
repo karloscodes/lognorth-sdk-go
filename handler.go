@@ -52,12 +52,13 @@ func generateTraceID() string {
 }
 
 var (
-	mu       sync.Mutex
-	apiKey   string
-	endpoint string
-	buffer   []event
-	timer    *time.Timer
-	backoff  time.Time
+	mu           sync.Mutex
+	apiKey       string
+	endpoint     string
+	buffer       []event
+	timer        *time.Timer
+	backoff      time.Time
+	ignoredPaths []string
 )
 
 func init() {
@@ -87,6 +88,27 @@ func Config(url, key string) {
 	defer mu.Unlock()
 	endpoint = url
 	apiKey = key
+}
+
+// IgnorePaths sets paths that should not be logged by the middleware.
+// Useful for health checks and metrics endpoints.
+//
+//	lognorth.IgnorePaths("/healthz", "/_health", "/metrics")
+func IgnorePaths(paths ...string) {
+	mu.Lock()
+	defer mu.Unlock()
+	ignoredPaths = paths
+}
+
+func isIgnoredPath(path string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range ignoredPaths {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Log sends a regular log message. Batched automatically.
@@ -307,8 +329,15 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 func (h *Handler) WithGroup(string) slog.Handler { return h }
 
 // Middleware logs HTTP requests with trace_id propagation.
+// Paths set via IgnorePaths() will not be logged.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if this path should be ignored
+		if isIgnoredPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: 200}
 
