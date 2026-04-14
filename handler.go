@@ -55,6 +55,8 @@ var (
 	mu           sync.Mutex
 	apiKey       string
 	endpoint     string
+	environment  string
+	enabled      = true
 	buffer       []event
 	timer        *time.Timer
 	backoff      time.Time
@@ -90,6 +92,69 @@ func Config(url, key string) {
 	apiKey = key
 }
 
+// Options configures the client with environment tagging and enable/disable
+// behavior. Use Configure for richer setup; Config remains for the simple case.
+type Options struct {
+	URL    string
+	APIKey string
+	// Environment is stamped on every event's context (e.g. "production",
+	// "staging", "preview"). Optional.
+	Environment string
+	// Enabled overrides the default. When nil, the SDK auto-disables only when
+	// Environment is "development" or "test"; everything else (staging, preview,
+	// qa, production, custom) opts in.
+	Enabled *bool
+}
+
+// Configure sets the endpoint, key, environment, and enable flag in one call.
+func Configure(opts Options) {
+	mu.Lock()
+	defer mu.Unlock()
+	endpoint = opts.URL
+	apiKey = opts.APIKey
+	environment = opts.Environment
+	if opts.Enabled != nil {
+		enabled = *opts.Enabled
+	} else {
+		enabled = opts.Environment != "development" && opts.Environment != "test"
+	}
+}
+
+// SetEnvironment changes the environment label after Configure/Config.
+func SetEnvironment(env string) {
+	mu.Lock()
+	defer mu.Unlock()
+	environment = env
+}
+
+// SetEnabled toggles whether events are sent. When false, all log/error calls
+// become no-ops (no buffer, no HTTP).
+func SetEnabled(b bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	enabled = b
+}
+
+func stampEnvironment(ctx map[string]any) map[string]any {
+	mu.Lock()
+	env := environment
+	mu.Unlock()
+	if env == "" {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = make(map[string]any)
+	}
+	ctx["environment"] = env
+	return ctx
+}
+
+func isEnabled() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return enabled
+}
+
 // IgnorePaths sets paths that should not be logged by the middleware.
 // Useful for health checks and metrics endpoints.
 //
@@ -120,6 +185,9 @@ func Log(message string, ctx map[string]any) {
 }
 
 func logEvent(message string, ctx map[string]any, traceID string, durationMS int, ts ...time.Time) {
+	if !isEnabled() {
+		return
+	}
 	timestamp := time.Now()
 	if len(ts) > 0 && !ts[0].IsZero() {
 		timestamp = ts[0]
@@ -129,7 +197,7 @@ func logEvent(message string, ctx map[string]any, traceID string, durationMS int
 		Timestamp:  timestamp.UTC().Format("2006-01-02T15:04:05.000000Z"),
 		TraceID:    traceID,
 		DurationMS: durationMS,
-		Context:    ctx,
+		Context:    stampEnvironment(ctx),
 	}
 	mu.Lock()
 	buffer = append(buffer, e)
@@ -156,6 +224,9 @@ func Error(message string, err error, ctx map[string]any) {
 }
 
 func errorEvent(message string, err error, ctx map[string]any, traceID string, callerSkip int, ts ...time.Time) {
+	if !isEnabled() {
+		return
+	}
 	timestamp := time.Now()
 	if len(ts) > 0 && !ts[0].IsZero() {
 		timestamp = ts[0]
@@ -163,6 +234,7 @@ func errorEvent(message string, err error, ctx map[string]any, traceID string, c
 	if ctx == nil {
 		ctx = make(map[string]any)
 	}
+	ctx = stampEnvironment(ctx)
 	ctx["error"] = err.Error()
 
 	errorClass := "error"

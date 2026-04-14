@@ -141,6 +141,8 @@ func TestMiddlewareGeneratesTraceID(t *testing.T) {
 		if traceID == "" {
 			t.Error("expected trace_id in request context")
 		}
+		// Ensure non-zero duration_ms — otherwise json:"omitempty" drops it.
+		time.Sleep(2 * time.Millisecond)
 		w.WriteHeader(200)
 	}))
 
@@ -219,5 +221,119 @@ func TestMiddlewareUsesIncomingTraceID(t *testing.T) {
 	event := events[0].(map[string]any)
 	if event["trace_id"] != "incoming-trace" {
 		t.Errorf("expected trace_id 'incoming-trace', got %v", event["trace_id"])
+	}
+}
+
+func TestEnvironmentStampedOnEvents(t *testing.T) {
+	var received []map[string]any
+	var rmu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		json.Unmarshal(body, &data)
+		rmu.Lock()
+		received = append(received, data)
+		rmu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	Configure(Options{URL: server.URL, APIKey: "test-key", Environment: "staging"})
+	defer Configure(Options{URL: server.URL, APIKey: "test-key"}) // reset for other tests
+
+	Log("hello", nil)
+	Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	rmu.Lock()
+	defer rmu.Unlock()
+	if len(received) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(received))
+	}
+	event := received[0]["events"].([]any)[0].(map[string]any)
+	ctx := event["context"].(map[string]any)
+	if ctx["environment"] != "staging" {
+		t.Errorf("expected environment 'staging', got %v", ctx["environment"])
+	}
+}
+
+func TestDisabledInTestAndDevelopmentByDefault(t *testing.T) {
+	for _, env := range []string{"test", "development"} {
+		t.Run(env, func(t *testing.T) {
+			var hits int
+			var hmu sync.Mutex
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hmu.Lock()
+				hits++
+				hmu.Unlock()
+				w.WriteHeader(200)
+			}))
+			defer server.Close()
+
+			Configure(Options{URL: server.URL, APIKey: "k", Environment: env})
+			Log("dropped", nil)
+			Flush()
+			time.Sleep(50 * time.Millisecond)
+
+			hmu.Lock()
+			defer hmu.Unlock()
+			if hits != 0 {
+				t.Errorf("expected 0 requests in env %q, got %d", env, hits)
+			}
+		})
+	}
+}
+
+func TestEnabledInOtherEnvsByDefault(t *testing.T) {
+	for _, env := range []string{"production", "staging", "preview", "qa", ""} {
+		t.Run(env, func(t *testing.T) {
+			var hits int
+			var hmu sync.Mutex
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hmu.Lock()
+				hits++
+				hmu.Unlock()
+				w.WriteHeader(200)
+			}))
+			defer server.Close()
+
+			Configure(Options{URL: server.URL, APIKey: "k", Environment: env})
+			Log("sent", nil)
+			Flush()
+			time.Sleep(50 * time.Millisecond)
+
+			hmu.Lock()
+			defer hmu.Unlock()
+			if hits != 1 {
+				t.Errorf("expected 1 request in env %q, got %d", env, hits)
+			}
+		})
+	}
+}
+
+func TestExplicitEnabledOverridesEnvDefault(t *testing.T) {
+	var hits int
+	var hmu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hmu.Lock()
+		hits++
+		hmu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	on := true
+	Configure(Options{URL: server.URL, APIKey: "k", Environment: "development", Enabled: &on})
+	defer Configure(Options{URL: server.URL, APIKey: "k"})
+
+	Log("forced on", nil)
+	Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	hmu.Lock()
+	defer hmu.Unlock()
+	if hits != 1 {
+		t.Errorf("expected explicit enabled=true to send in dev, got %d hits", hits)
 	}
 }
