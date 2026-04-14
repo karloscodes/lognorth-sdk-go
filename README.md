@@ -53,6 +53,18 @@ func main() {
 }
 ```
 
+### Skipping noisy endpoints
+
+Health checks and uptime probes swamp the log feed if you let them
+through. Tell the SDK which paths to skip:
+
+```go
+lognorth.IgnorePaths("/healthz", "/ping", "/up")
+```
+
+No default list — opt in to the ones that match your deployment.
+Matches exact path or `path/…` prefix.
+
 ## How It Works
 
 - `Log()` batches events (10 or 5s)
