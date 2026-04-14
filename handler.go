@@ -32,7 +32,11 @@ type event struct {
 
 type ctxKey int
 
-const traceIDKey ctxKey = 0
+const (
+	traceIDKey ctxKey = iota
+	routeKey
+	handlerKey
+)
 
 func withTraceID(ctx context.Context, traceID string) context.Context {
 	return context.WithValue(ctx, traceIDKey, traceID)
@@ -43,6 +47,41 @@ func traceIDFromContext(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+// WithRoute returns a context with route info stamped on it. Call this inside
+// your handler (or router-specific middleware) so the request event carries
+// the route pattern and the handler function name:
+//
+//	// chi example:
+//	r.Use(func(next http.Handler) http.Handler {
+//	    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//	        rc := chi.RouteContext(r.Context())
+//	        ctx := lognorth.WithRoute(r.Context(), rc.RoutePattern(), "")
+//	        next.ServeHTTP(w, r.WithContext(ctx))
+//	    })
+//	})
+//
+// Empty strings are ignored. Standard library Go 1.22+ ServeMux users don't
+// need this — lognorth.Middleware reads r.Pattern automatically.
+func WithRoute(ctx context.Context, route, handler string) context.Context {
+	if route != "" {
+		ctx = context.WithValue(ctx, routeKey, route)
+	}
+	if handler != "" {
+		ctx = context.WithValue(ctx, handlerKey, handler)
+	}
+	return ctx
+}
+
+func routeFromContext(ctx context.Context) (route, handler string) {
+	if v, ok := ctx.Value(routeKey).(string); ok {
+		route = v
+	}
+	if v, ok := ctx.Value(handlerKey).(string); ok {
+		handler = v
+	}
+	return
 }
 
 func generateTraceID() string {
@@ -423,9 +462,24 @@ func Middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(rw, r)
 
+		eventCtx := map[string]any{"method": r.Method, "path": r.URL.Path, "status": rw.status}
+
+		// Prefer the Go 1.22+ ServeMux pattern if set; otherwise fall back
+		// to whatever the user stamped via WithRoute (chi, echo, etc.).
+		route, handlerName := routeFromContext(r.Context())
+		if r.Pattern != "" {
+			route = r.Pattern
+		}
+		if route != "" {
+			eventCtx["route"] = route
+		}
+		if handlerName != "" {
+			eventCtx["handler"] = handlerName
+		}
+
 		logEvent(
 			fmt.Sprintf("%s %s → %d", r.Method, r.URL.Path, rw.status),
-			map[string]any{"method": r.Method, "path": r.URL.Path, "status": rw.status},
+			eventCtx,
 			traceID,
 			int(time.Since(start).Milliseconds()),
 			start,

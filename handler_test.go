@@ -224,6 +224,89 @@ func TestMiddlewareUsesIncomingTraceID(t *testing.T) {
 	}
 }
 
+func TestMiddlewareStampsRouteFromServeMuxPattern(t *testing.T) {
+	var received []map[string]any
+	var rmu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		json.Unmarshal(body, &data)
+		rmu.Lock()
+		received = append(received, data)
+		rmu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	Configure(Options{URL: server.URL, APIKey: "k"})
+	defer Configure(Options{URL: server.URL, APIKey: "k"})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond)
+		w.WriteHeader(200)
+	})
+	handler := Middleware(mux)
+
+	req := httptest.NewRequest("GET", "/users/42", nil)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	rmu.Lock()
+	defer rmu.Unlock()
+	if len(received) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(received))
+	}
+	ctx := received[0]["events"].([]any)[0].(map[string]any)["context"].(map[string]any)
+	if ctx["route"] != "GET /users/{id}" {
+		t.Errorf("expected route 'GET /users/{id}', got %v", ctx["route"])
+	}
+}
+
+func TestMiddlewareStampsRouteFromWithRouteHelper(t *testing.T) {
+	var received []map[string]any
+	var rmu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		json.Unmarshal(body, &data)
+		rmu.Lock()
+		received = append(received, data)
+		rmu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer server.Close()
+
+	Configure(Options{URL: server.URL, APIKey: "k"})
+	defer Configure(Options{URL: server.URL, APIKey: "k"})
+
+	// Simulate a non-ServeMux router (e.g. chi) by stamping via WithRoute.
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := WithRoute(r.Context(), "/conversations/:id", "showConversation")
+		*r = *r.WithContext(ctx)
+		time.Sleep(2 * time.Millisecond)
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/conversations/7", nil)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	Flush()
+	time.Sleep(50 * time.Millisecond)
+
+	rmu.Lock()
+	defer rmu.Unlock()
+	ctx := received[0]["events"].([]any)[0].(map[string]any)["context"].(map[string]any)
+	if ctx["route"] != "/conversations/:id" {
+		t.Errorf("expected route '/conversations/:id', got %v", ctx["route"])
+	}
+	if ctx["handler"] != "showConversation" {
+		t.Errorf("expected handler 'showConversation', got %v", ctx["handler"])
+	}
+}
+
 func TestEnvironmentStampedOnEvents(t *testing.T) {
 	var received []map[string]any
 	var rmu sync.Mutex
