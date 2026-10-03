@@ -1,11 +1,9 @@
 package lognorth
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,8 +18,6 @@ import (
 	"syscall"
 	"time"
 )
-
-const maxBuffer = 1000
 
 type event struct {
 	Message    string         `json:"message"`
@@ -97,9 +93,7 @@ var (
 	endpoint     string
 	environment  string
 	enabled      = true
-	buffer       []event
 	timer        *time.Timer
-	backoff      time.Time
 	ignoredPaths []string
 )
 
@@ -117,7 +111,7 @@ func init() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
-		Flush()
+		shutdown()
 		os.Exit(0)
 	}()
 }
@@ -248,23 +242,10 @@ func logEvent(message string, ctx map[string]any, traceID string, durationMS int
 		DurationMS: durationMS,
 		Context:    stampEnvironment(ctx),
 	}
-	mu.Lock()
-	buffer = append(buffer, e)
-	if len(buffer) > maxBuffer {
-		buffer = buffer[len(buffer)-maxBuffer:]
-	}
-	n := len(buffer)
-	if timer == nil {
-		timer = time.AfterFunc(5*time.Second, Flush)
-	}
-	mu.Unlock()
-
-	if n >= 10 {
-		go Flush()
-	}
+	enqueue(e)
 }
 
-// Error sends an error log immediately.
+// Error queues an error event and starts sending it at once.
 // For trace ID propagation inside HTTP handlers, use slog with NewHandler() instead:
 //
 //	slog.ErrorContext(r.Context(), "query failed", "error", err)
@@ -308,73 +289,12 @@ func errorEvent(message string, err error, ctx map[string]any, traceID string, c
 	n := runtime.Stack(buf, false)
 	ctx["stack_trace"] = string(buf[:n])
 
-	go send([]event{{
+	enqueue(event{
 		Message:   message,
 		Timestamp: timestamp.UTC().Format("2006-01-02T15:04:05.000000Z"),
 		TraceID:   traceID,
 		Context:   ctx,
-	}}, true)
-}
-
-// Flush sends all buffered events.
-func Flush() {
-	mu.Lock()
-	if timer != nil {
-		timer.Stop()
-		timer = nil
-	}
-	if len(buffer) == 0 {
-		mu.Unlock()
-		return
-	}
-	events := buffer
-	buffer = nil
-	mu.Unlock()
-
-	send(events, false)
-}
-
-func requeue(events []event) {
-	mu.Lock()
-	buffer = append(events, buffer...)
-	if len(buffer) > maxBuffer {
-		buffer = buffer[:maxBuffer]
-	}
-	mu.Unlock()
-}
-
-func send(events []event, isError bool) {
-	if len(events) == 0 || endpoint == "" {
-		return
-	}
-
-	mu.Lock()
-	if time.Now().Before(backoff) {
-		mu.Unlock()
-		return
-	}
-	mu.Unlock()
-
-	body, _ := json.Marshal(map[string]any{"events": events})
-	req, _ := http.NewRequest("POST", endpoint+"/api/v1/events/batch", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		if isError {
-			requeue(events)
-		}
-		return
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode == 429 {
-		mu.Lock()
-		backoff = time.Now().Add(5 * time.Second)
-		mu.Unlock()
-		requeue(events)
-	}
+	})
 }
 
 // Logger wraps a context for convenient slog calls with trace ID propagation.
