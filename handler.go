@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -101,6 +102,15 @@ var (
 	backoff      time.Time
 	ignoredPaths []string
 )
+
+// client gives up on a connect after 5 seconds and on a request after 10.
+var client = newClient()
+
+func newClient() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	return &http.Client{Timeout: 10 * time.Second, Transport: t}
+}
 
 func init() {
 	go func() {
@@ -350,7 +360,7 @@ func send(events []event, isError bool) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		if isError {
 			requeue(events)
