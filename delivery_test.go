@@ -229,9 +229,7 @@ func TestNetworkFailureKeepsLogEvents(t *testing.T) {
 	Log("two", nil)
 	Flush()
 	time.Sleep(30 * time.Millisecond)
-	if queued() != 2 {
-		t.Fatalf("expected 2 events kept while the server is down, got %d", queued())
-	}
+	waitFor(t, "2 events kept while the server is down", func() bool { return queued() == 2 })
 
 	c := &collector{}
 	srv := httptest.NewUnstartedServer(c.handler(accept))
@@ -306,8 +304,9 @@ func TestUnauthorizedKeepsEvents(t *testing.T) {
 	Flush()
 	waitFor(t, "retries", func() bool { return c.requestCount() >= 3 })
 
-	if queued() != 2 || c.deliveredCount() != 0 {
-		t.Fatalf("expected 2 events kept, got %d queued", queued())
+	waitFor(t, "2 events kept", func() bool { return queued() == 2 })
+	if c.deliveredCount() != 0 {
+		t.Fatalf("expected no delivery on 401, got %d events", c.deliveredCount())
 	}
 	if n := strings.Count(stderrText(), "HTTP 401"); n != 1 {
 		t.Errorf("expected one stderr line about HTTP 401, got %d:\n%s", n, stderrText())
