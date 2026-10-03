@@ -67,9 +67,28 @@ Matches exact path or `path/…` prefix.
 
 ## How It Works
 
-- `Log()` batches events (10 or 5s)
-- `Error()` sends immediately
-- Auto-flushes on shutdown
+- `Log()` and `Error()` return at once. They never block your app.
+- Events wait in a memory queue. The SDK sends them when 10 are queued, after 5 seconds, or at once for an error.
+- One request is in flight at a time. A batch holds at most 500 events and 1 MB.
+- Events stay in order, also across retries.
+
+### When delivery fails
+
+- Network errors, timeouts, and 5xx answers: the SDK keeps the events and retries. It waits 1 second, then doubles the wait up to 60 seconds.
+- 429 and 503: the SDK waits as long as `Retry-After` says.
+- 401, 403, and 404: the SDK keeps the events, writes one line to stderr, and retries after 60 seconds, up to every 5 minutes. Fix the URL or the API key and the events arrive.
+- 400, 413, and other 4xx: the SDK splits the batch in two and sends the halves. It drops a single event only when the server still rejects it.
+
+### Memory limits
+
+- The queue holds at most 10,000 events or 10 MB.
+- Each event is cut to 64 KB. Long strings are shortened and the event gets `truncated: true`.
+- When the queue is full, the SDK drops the oldest log events first. It keeps errors longest.
+- After the next success, the SDK sends one event, `LogNorth client dropped N events`, with the counts in `dropped` and `dropped_errors`.
+
+### Shutdown
+
+On SIGINT and SIGTERM the SDK sends what is queued, within 5 seconds. Call `lognorth.Flush()` before your app exits in other ways.
 
 ## License
 
