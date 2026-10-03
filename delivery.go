@@ -331,11 +331,12 @@ func sendNext(ctx context.Context) bool {
 		return true
 	case err == nil && (status == 429 || status == 503):
 		putBack(batch)
-		wait := nextBackoff()
+		// The server said when; the backoff stays for failures that do not say.
 		if s, err := strconv.Atoi(retryAfter); err == nil {
-			wait = time.Duration(min(max(s, 1), 300)) * retryAfterUnit
+			retryAt = time.Now().Add(time.Duration(min(max(s, 1), 300)) * retryAfterUnit)
+		} else {
+			retryAt = time.Now().Add(nextBackoff())
 		}
-		retryAt = time.Now().Add(wait)
 		fail("retry", fmt.Sprintf("lognorth: server busy (HTTP %d), retrying", status))
 		return false
 	case err == nil && (status == 401 || status == 403 || status == 404):

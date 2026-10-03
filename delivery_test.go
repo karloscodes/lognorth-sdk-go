@@ -195,6 +195,26 @@ func TestRetryAfter(t *testing.T) {
 	}
 }
 
+func TestRetryAfterDoesNotGrowTheBackoff(t *testing.T) {
+	c := newCollector(t, func(n int, _ []map[string]any) (int, string) {
+		switch {
+		case n <= 4:
+			return 503, "1"
+		case n == 5:
+			return 500, ""
+		}
+		return 201, ""
+	})
+
+	Log("a", nil)
+	Flush()
+	waitFor(t, "delivery", func() bool { return c.deliveredCount() == 1 })
+
+	if gap := c.times[5].Sub(c.times[4]); gap > 40*time.Millisecond {
+		t.Errorf("expected the first backoff of about 10ms after the 500, got %v", gap)
+	}
+}
+
 func TestServerErrorIsRetriedWithBackoff(t *testing.T) {
 	c := newCollector(t, func(n int, _ []map[string]any) (int, string) {
 		if n <= 2 {
