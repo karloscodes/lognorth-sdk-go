@@ -53,6 +53,24 @@ func main() {
 }
 ```
 
+### Who hit the error, and in which release
+
+Name the signed-in user inside a handler. Use an ID, not an email:
+
+```go
+lognorth.SetUser(r.Context(), strconv.Itoa(user.ID))
+```
+
+The request event carries it, and so do errors you log with the request's context. LogNorth then shows how many users an issue hit.
+
+Errors also carry the release. The SDK reads `LOGNORTH_RELEASE`, `GIT_SHA`, `KAMAL_VERSION`, or the commit variable of Render, Heroku, Railway, Vercel, or Coolify. Or set it:
+
+```go
+lognorth.Configure(lognorth.Options{URL: url, APIKey: key, Release: version})
+```
+
+A failed request (5xx) also carries its user agent, so you can tell a bot from a browser.
+
 ### Skipping noisy endpoints
 
 Health checks and uptime probes swamp the log feed if you let them

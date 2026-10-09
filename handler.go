@@ -33,7 +33,40 @@ const (
 	traceIDKey ctxKey = iota
 	routeKey
 	handlerKey
+	requestKey
 )
+
+// request holds what a handler learns about its request while it runs, such
+// as the signed-in user. The middleware reads it when the request ends.
+type request struct {
+	mu   sync.Mutex
+	user string
+}
+
+// SetUser names the user of the current request: an ID, not an email. The
+// request event carries it, and so do errors logged with the request's
+// context, so an issue shows how many users it hit. Call it in a handler or
+// an auth middleware that runs inside lognorth.Middleware; elsewhere it does
+// nothing.
+//
+//	lognorth.SetUser(r.Context(), strconv.Itoa(user.ID))
+func SetUser(ctx context.Context, id string) {
+	if req, ok := ctx.Value(requestKey).(*request); ok {
+		req.mu.Lock()
+		req.user = id
+		req.mu.Unlock()
+	}
+}
+
+func userFromContext(ctx context.Context) string {
+	req, ok := ctx.Value(requestKey).(*request)
+	if !ok {
+		return ""
+	}
+	req.mu.Lock()
+	defer req.mu.Unlock()
+	return req.user
+}
 
 func withTraceID(ctx context.Context, traceID string) context.Context {
 	return context.WithValue(ctx, traceIDKey, traceID)
@@ -95,7 +128,24 @@ var (
 	enabled      = true
 	timer        *time.Timer
 	ignoredPaths []string
+	release      = releaseFromEnv()
 )
+
+// releaseEnv lists where deploy tools put the version that runs. The first
+// one set wins.
+var releaseEnv = []string{
+	"LOGNORTH_RELEASE", "GIT_SHA", "GIT_COMMIT", "SOURCE_COMMIT", "KAMAL_VERSION",
+	"RENDER_GIT_COMMIT", "HEROKU_SLUG_COMMIT", "SOURCE_VERSION", "RAILWAY_GIT_COMMIT_SHA", "VERCEL_GIT_COMMIT_SHA",
+}
+
+func releaseFromEnv() string {
+	for _, k := range releaseEnv {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
 
 // client gives up on a connect after 5 seconds and on a request after 10.
 var client = newClient()
@@ -143,6 +193,11 @@ type Options struct {
 	// Environment is stamped on every event's context (e.g. "production",
 	// "staging", "preview"). Optional.
 	Environment string
+	// Release is the version that runs, such as a git SHA. Error events carry
+	// it, so an issue shows the release it first appeared in. When empty, the
+	// SDK reads LOGNORTH_RELEASE, GIT_SHA, KAMAL_VERSION, and the variables
+	// that common hosts set.
+	Release string
 	// Enabled overrides the default. When nil, the SDK auto-disables only when
 	// Environment is "development" or "test"; everything else (staging, preview,
 	// qa, production, custom) opts in.
@@ -156,6 +211,10 @@ func Configure(opts Options) {
 	endpoint = opts.URL
 	apiKey = opts.APIKey
 	environment = opts.Environment
+	release = opts.Release
+	if release == "" {
+		release = releaseFromEnv()
+	}
 	if opts.Enabled != nil {
 		enabled = *opts.Enabled
 	} else {
@@ -334,6 +393,9 @@ func (h *Handler) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (h *Handler) Handle(c context.Context, r slog.Record) error {
 	ctx := make(map[string]any)
 	traceID := traceIDFromContext(c)
+	if user := userFromContext(c); user != "" {
+		ctx["user"] = user
+	}
 
 	for _, a := range h.attrs {
 		ctx[a.Key] = a.Value.Any()
@@ -387,7 +449,7 @@ func Middleware(next http.Handler) http.Handler {
 			traceID = generateTraceID()
 		}
 		w.Header().Set("X-Trace-ID", traceID)
-		ctx := withTraceID(r.Context(), traceID)
+		ctx := context.WithValue(withTraceID(r.Context(), traceID), requestKey, &request{})
 		r = r.WithContext(ctx)
 
 		next.ServeHTTP(rw, r)
@@ -405,6 +467,14 @@ func Middleware(next http.Handler) http.Handler {
 		}
 		if handlerName != "" {
 			eventCtx["handler"] = handlerName
+		}
+		if user := userFromContext(ctx); user != "" {
+			eventCtx["user"] = user
+		}
+		// The user agent tells a bot from a browser on a failed request.
+		// Only failed ones carry it, to keep every other event small.
+		if rw.status >= 500 && r.UserAgent() != "" {
+			eventCtx["user_agent"] = r.UserAgent()
 		}
 
 		logEvent(

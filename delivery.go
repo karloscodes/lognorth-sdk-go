@@ -46,7 +46,7 @@ var stderr io.Writer = os.Stderr
 
 // minimalContext lists the context keys kept when an event is still too big
 // after trimming its strings.
-var minimalContext = []string{"error", "error_class", "error_file", "error_line", "method", "path", "status", "environment"}
+var minimalContext = []string{"error", "error_class", "error_file", "error_line", "method", "path", "status", "environment", "release", "user"}
 
 // item is one queued event, stored as the JSON the server receives.
 type item struct {
@@ -75,6 +75,9 @@ var (
 // a batch is due. It never blocks on the network.
 func enqueue(e event) {
 	isErr := isError(e.Context)
+	if isErr {
+		e.Context = stampRelease(e.Context)
+	}
 	raw, ok := trim(&e)
 
 	mu.Lock()
@@ -96,6 +99,19 @@ func enqueue(e event) {
 	if due {
 		wake()
 	}
+}
+
+// stampRelease adds the release to an error event's context. Only errors
+// carry it: that is where it answers which deploy broke something.
+func stampRelease(ctx map[string]any) map[string]any {
+	mu.Lock()
+	r := release
+	mu.Unlock()
+	if r == "" || ctx["release"] != nil {
+		return ctx
+	}
+	ctx["release"] = r
+	return ctx
 }
 
 // isError reports whether an event counts as an error for the drop order.
