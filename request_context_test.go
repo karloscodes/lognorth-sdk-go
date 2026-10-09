@@ -128,7 +128,7 @@ func TestRelease(t *testing.T) {
 		Log("signed up", nil)
 		Error("charge failed", errors.New("card declined"), nil)
 
-		got := events()
+		got := events()[1:] // the first is the start of the release
 		if len(got) != 2 {
 			t.Fatalf("expected 2 events, got %v", got)
 		}
@@ -149,8 +149,23 @@ func TestRelease(t *testing.T) {
 		Error("charge failed", errors.New("card declined"), nil)
 
 		got := events()
-		if len(got) != 1 || got[0]["release"] != "f00ba44" {
-			t.Fatalf("expected release f00ba44, got %v", got)
+		if len(got) != 2 || got[1]["release"] != "f00ba44" {
+			t.Fatalf("expected the error with release f00ba44, got %v", got)
+		}
+	})
+
+	t.Run("the client says once that the release started", func(t *testing.T) {
+		events := collect(t, Options{Release: "c0ffee1"})
+		mu.Lock()
+		url := endpoint
+		mu.Unlock()
+
+		Configure(Options{URL: url, APIKey: "k", Release: "c0ffee1"})
+
+		got := events()
+
+		if len(got) != 1 || got[0]["release"] != "c0ffee1" {
+			t.Fatalf("expected one start event for c0ffee1, got %v", got)
 		}
 	})
 }

@@ -180,9 +180,10 @@ type ErrorFields struct {
 // Config sets the endpoint and API key. Call once at startup.
 func Config(url, key string) {
 	mu.Lock()
-	defer mu.Unlock()
 	endpoint = url
 	apiKey = key
+	mu.Unlock()
+	announceRelease()
 }
 
 // Options configures the client with environment tagging and enable/disable
@@ -207,7 +208,6 @@ type Options struct {
 // Configure sets the endpoint, key, environment, and enable flag in one call.
 func Configure(opts Options) {
 	mu.Lock()
-	defer mu.Unlock()
 	endpoint = opts.URL
 	apiKey = opts.APIKey
 	environment = opts.Environment
@@ -220,6 +220,26 @@ func Configure(opts Options) {
 	} else {
 		enabled = opts.Environment != "development" && opts.Environment != "test"
 	}
+	mu.Unlock()
+	announceRelease()
+}
+
+// announced is the release this process last said it started.
+var announced string
+
+// announceRelease logs "Release <version> started" once per release, when
+// the client is configured. LogNorth takes the first start of a release as
+// its deploy time and marks it on its charts.
+func announceRelease() {
+	mu.Lock()
+	r := release
+	if r == "" || r == announced || !enabled {
+		mu.Unlock()
+		return
+	}
+	announced = r
+	mu.Unlock()
+	logEvent("Release "+r+" started", map[string]any{"release": r}, "", 0)
 }
 
 // SetEnvironment changes the environment label after Configure/Config.
