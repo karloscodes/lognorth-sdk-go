@@ -1,0 +1,50 @@
+# A tag v* makes a release of the module: notes on GitHub, and the Go proxy
+# serves the tag itself. A tag with a hyphen (v1.9.0-rc.1) is a pre-release,
+# and it can come from a branch other than main, such as a next major.
+# This file is the same in cartridge and lognorth-sdk-go.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read only by default: only the job that publishes can write the release.
+permissions:
+  contents: read
+
+jobs:
+  # The same gate as the go-test job of CI, so a tag on a red commit releases
+  # nothing.
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          # Minor, not go.mod's 1.26.0: an exact patch pins setup-go.
+          go-version: "1.26"
+          check-latest: true
+      - run: CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./...
+      - run: go test -race ./...
+
+  release:
+    name: Create Release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A tag with a hyphen (v1.9.0-rc.1) is a pre-release, which
+          # releases/latest skips.
+          prerelease=false
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=true; fi
+          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag --prerelease="$prerelease"
