@@ -28,12 +28,12 @@ jobs:
   # Minor, not go.mod's patch: an exact patch pins setup-go, and go.mod names only
   # the oldest Go this library supports.
   security:
-    uses: karloscodes/workflows/.github/workflows/go-security.yml@v1.1.0
+    uses: karloscodes/workflows/.github/workflows/go-security.yml@main
     with:
       go-version: "1.26"
 
   gitleaks:
-    uses: karloscodes/workflows/.github/workflows/gitleaks.yml@v1.1.0
+    uses: karloscodes/workflows/.github/workflows/gitleaks.yml@main
 
   # The one check to require on main: it passes when every job above passed.
   test:
